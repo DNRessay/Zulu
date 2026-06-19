@@ -33,6 +33,19 @@ jobs:
 
       - name: Run pipeline
         run: python pipeline.py
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+
+      - name: Report D1 size
+        if: always()
+        run: |
+          python -c "import db; print(f'D1 size: {db.get_db_size_mb():.1f} MB / {db.D1_LIMIT_MB} MB')" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
 
       - name: Upload JSONL artifact
         uses: actions/upload-artifact@v4
