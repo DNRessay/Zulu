@@ -7,7 +7,9 @@ _DB_ID   = os.environ.get("CF_D1_DATABASE_ID", "")
 _TOKEN   = os.environ.get("CF_API_TOKEN", "")
 _BASE    = f"https://api.cloudflare.com/client/v4/accounts/{_ACCOUNT}/d1/database/{_DB_ID}"
 
-BATCH_CHUNK = 50  # max statements per /batch call
+BATCH_CHUNK  = 50  # max statements per /batch call
+D1_LIMIT_MB  = 500
+D1_SAFETY_MB = 25  # stop accepting new pages this many MB before the cap
 
 
 def _headers():
@@ -45,6 +47,23 @@ def _batch(statements):
     for i in range(0, len(statements), BATCH_CHUNK):
         out.extend(_post("batch", {"statements": statements[i : i + BATCH_CHUNK]}))
     return out
+
+
+# ── size monitoring ──────────────────────────────────────────────────────────
+
+def get_db_size_mb():
+    """Returns current D1 database size in MB via the Cloudflare API."""
+    r = requests.get(_BASE, headers=_headers(), timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("success"):
+        raise RuntimeError(f"D1: {data.get('errors')}")
+    bytes_used = data.get("result", {}).get("file_size", 0)
+    return bytes_used / (1024 * 1024)
+
+
+def near_size_limit():
+    return get_db_size_mb() >= (D1_LIMIT_MB - D1_SAFETY_MB)
 
 
 # ── schema ────────────────────────────────────────────────────────────────────
