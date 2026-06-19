@@ -326,7 +326,7 @@ def run_ocr(total_pages):
         if db.near_size_limit():
             saved = db.count_processed_pages()
             size  = db.get_db_size_mb()
-            print(f"D1 near {db.D1_LIMIT_MB}MB limit ({size:.1f}MB used). Saved {saved}/{total_pages} pages. Exiting gracefully.")
+            print(f"Neon near {db.NEON_LIMIT_MB}MB limit ({size:.1f}MB used). Saved {saved}/{total_pages} pages. Exiting gracefully.")
             sys.exit(0)
 
         print(f"  OCR pages {batch_start}-{batch_end} ({len(pending)} pending)…", end=" ", flush=True)

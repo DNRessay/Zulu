@@ -1,142 +1,134 @@
 import os
 import time
-import requests
+import psycopg2
+import psycopg2.extras
 
-_ACCOUNT = os.environ.get("CF_ACCOUNT_ID", "")
-_DB_ID   = os.environ.get("CF_D1_DATABASE_ID", "")
-_TOKEN   = os.environ.get("CF_API_TOKEN", "")
-_BASE    = f"https://api.cloudflare.com/client/v4/accounts/{_ACCOUNT}/d1/database/{_DB_ID}"
+_DSN = os.environ.get("DATABASE_URL", "")
 
-BATCH_CHUNK  = 50  # max statements per /batch call
-D1_LIMIT_MB  = 500
-D1_SAFETY_MB = 25  # stop accepting new pages this many MB before the cap
+# Neon free tier: 512 MB storage. Stop before we hit it.
+NEON_LIMIT_MB  = 512
+NEON_SAFETY_MB = 25   # stop accepting new pages this many MB before the cap
 
-
-def _headers():
-    return {"Authorization": f"Bearer {_TOKEN}", "Content-Type": "application/json"}
+BATCH_CHUNK = 100  # rows per executemany batch
 
 
-def _post(endpoint, payload, retries=4):
-    for attempt in range(retries):
-        try:
-            r = requests.post(
-                f"{_BASE}/{endpoint}", headers=_headers(), json=payload, timeout=30
-            )
-            r.raise_for_status()
-            data = r.json()
-            if not data.get("success"):
-                raise RuntimeError(f"D1: {data.get('errors')}")
-            return data.get("result", [])
-        except Exception as exc:
-            if attempt == retries - 1:
-                raise
-            wait = 2 ** attempt
-            print(f"  D1 retry {attempt + 1}/{retries} ({wait}s): {exc}")
-            time.sleep(wait)
-
-
-def _query(sql, params=None):
-    result = _post("query", {"sql": sql, "params": params or []})
-    return result[0] if result else {}
-
-
-def _batch(statements):
-    if not statements:
-        return []
-    out = []
-    for i in range(0, len(statements), BATCH_CHUNK):
-        out.extend(_post("batch", {"statements": statements[i : i + BATCH_CHUNK]}))
-    return out
-
-
-# ── size monitoring ──────────────────────────────────────────────────────────
-
-def get_db_size_mb():
-    """Returns current D1 database size in MB via the Cloudflare API."""
-    r = requests.get(_BASE, headers=_headers(), timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if not data.get("success"):
-        raise RuntimeError(f"D1: {data.get('errors')}")
-    bytes_used = data.get("result", {}).get("file_size", 0)
-    return bytes_used / (1024 * 1024)
-
-
-def near_size_limit():
-    return get_db_size_mb() >= (D1_LIMIT_MB - D1_SAFETY_MB)
+def _connect():
+    return psycopg2.connect(_DSN, sslmode="require")
 
 
 # ── schema ────────────────────────────────────────────────────────────────────
 
 def init_db():
-    _batch([
-        {
-            "sql": (
-                "CREATE TABLE IF NOT EXISTS pipeline_meta "
-                "(key TEXT PRIMARY KEY, value TEXT)"
-            )
-        },
-        {
-            "sql": (
-                "CREATE TABLE IF NOT EXISTS ocr_pages ("
-                "page_num INTEGER PRIMARY KEY, "
-                "raw_text TEXT, "
-                "saved_at TEXT DEFAULT (datetime('now')))"
-            )
-        },
-    ])
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pipeline_meta (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ocr_pages (
+                    page_num  INTEGER PRIMARY KEY,
+                    raw_text  TEXT,
+                    saved_at  TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+        conn.commit()
+
+
+# ── size monitoring ──────────────────────────────────────────────────────────
+
+def get_db_size_mb():
+    """Returns combined on-disk size of both tables in MB."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COALESCE(pg_total_relation_size('ocr_pages'), 0)
+                     + COALESCE(pg_total_relation_size('pipeline_meta'), 0)
+            """)
+            bytes_used = cur.fetchone()[0] or 0
+    return bytes_used / (1024 * 1024)
+
+
+def near_size_limit():
+    return get_db_size_mb() >= (NEON_LIMIT_MB - NEON_SAFETY_MB)
 
 
 # ── metadata ──────────────────────────────────────────────────────────────────
 
 def get_meta(key):
-    rows = _query("SELECT value FROM pipeline_meta WHERE key=?", [key]).get("results", [])
-    return rows[0]["value"] if rows else None
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM pipeline_meta WHERE key = %s", (key,))
+            row = cur.fetchone()
+    return row[0] if row else None
 
 
 def set_meta(key, value):
-    _query(
-        "INSERT OR REPLACE INTO pipeline_meta (key, value) VALUES (?,?)",
-        [key, str(value)],
-    )
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO pipeline_meta (key, value)
+                VALUES (%s, %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (key, str(value)))
+        conn.commit()
 
 
 # ── ocr pages ─────────────────────────────────────────────────────────────────
 
 def get_processed_pages():
-    rows = _query("SELECT page_num FROM ocr_pages").get("results", [])
-    return {r["page_num"] for r in rows}
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT page_num FROM ocr_pages")
+            rows = cur.fetchall()
+    return {r[0] for r in rows}
 
 
 def count_processed_pages():
-    rows = _query("SELECT COUNT(*) as cnt FROM ocr_pages").get("results", [])
-    return rows[0]["cnt"] if rows else 0
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM ocr_pages")
+            row = cur.fetchone()
+    return row[0] if row else 0
 
 
 def save_ocr_pages(results):
     """Batch-insert OCR results; silently skips pages already stored."""
-    stmts = [
-        {
-            "sql": "INSERT OR IGNORE INTO ocr_pages (page_num, raw_text) VALUES (?,?)",
-            "params": [r["page"], r["text"]],
-        }
-        for r in results
-    ]
-    _batch(stmts)
+    if not results:
+        return
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            for i in range(0, len(results), BATCH_CHUNK):
+                chunk = results[i:i + BATCH_CHUNK]
+                psycopg2.extras.execute_values(
+                    cur,
+                    """
+                    INSERT INTO ocr_pages (page_num, raw_text)
+                    VALUES %s
+                    ON CONFLICT (page_num) DO NOTHING
+                    """,
+                    [(r["page"], r["text"]) for r in chunk],
+                )
+        conn.commit()
 
 
 def load_all_ocr_pages():
-    rows = (
-        _query("SELECT page_num, raw_text FROM ocr_pages ORDER BY page_num ASC")
-        .get("results", [])
-    )
-    return [{"page": r["page_num"], "text": r["raw_text"]} for r in rows]
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT page_num, raw_text FROM ocr_pages ORDER BY page_num ASC"
+            )
+            rows = cur.fetchall()
+    return [{"page": r[0], "text": r[1]} for r in rows]
 
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 
 def cleanup():
-    _batch([
-        {"sql": "DROP TABLE IF EXISTS ocr_pages"},
-        {"sql": "DROP TABLE IF EXISTS pipeline_meta"},
-    ])
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS ocr_pages")
+            cur.execute("DROP TABLE IF EXISTS pipeline_meta")
+        conn.commit()
