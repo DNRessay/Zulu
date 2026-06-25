@@ -2,6 +2,8 @@ name: Zulu Bible Pipeline
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'   # runs every day at 2 AM UTC
 
 jobs:
   build:
@@ -37,13 +39,14 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
       - name: Report Neon DB size
-        if: always()
+        if: always()                          # ← already had this, good
         run: |
           python -c "import db; print(f'Neon size: {db.get_db_size_mb():.1f} MB / {db.NEON_LIMIT_MB} MB')" >> "$GITHUB_STEP_SUMMARY"
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
       - name: Upload JSONL artifact
+        if: always()                          # ← ADD THIS so it uploads even on timeout
         uses: actions/upload-artifact@v4
         with:
           name: zu_en_bible_jsonl
