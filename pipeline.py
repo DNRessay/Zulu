@@ -15,8 +15,8 @@ import db
 # ── timing ────────────────────────────────────────────────────────────────────
 
 _START = time.time()
-TIMEOUT_SECS  = 90 * 60   # self-imposed hard limit
-SAFETY_BUFFER =  3 * 60   # stop accepting new batches this many seconds before limit
+TIMEOUT_SECS  = 120 * 60  # self-imposed hard limit
+SAFETY_BUFFER =  5 * 60   # stop accepting new batches this many seconds before limit
 
 def _elapsed():
     return time.time() - _START
